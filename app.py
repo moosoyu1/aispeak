@@ -146,6 +146,7 @@ def ensure_state() -> None:
     st.session_state.setdefault("manual_input", "")
     st.session_state.setdefault("groq_api_key", "")
     st.session_state.setdefault("conversation_started", False)
+    st.session_state.setdefault("voice_active", False)
 
 
 def sync_component_app_state() -> None:
@@ -165,6 +166,9 @@ def sync_component_app_state() -> None:
 def process_voice_event(payload: dict[str, Any]) -> None:
     if not isinstance(payload, dict):
         return
+    if not st.session_state.get("conversation_started", False):
+        return
+
     transcript = payload.get("transcript", "").strip()
     wake_word = payload.get("wakeWord", "미감지")
     status = payload.get("status", "idle")
@@ -227,6 +231,33 @@ def render_reminders() -> None:
                 st.rerun()
 
 
+def render_sidebar_voice_status() -> None:
+    state = st.session_state.get(APP_STATE_KEY, {})
+    status = state.get("status", "idle")
+    label_map = {
+        "idle": "대기 중",
+        "listening": "듣는 중",
+        "result_ready": "인식 완료",
+        "error": "오류",
+        "processing": "처리 중",
+    }
+    transcript = state.get("transcript", "") or "없음"
+    wake_word = state.get("wakeWord", "미감지")
+    last_command = state.get("lastCommand", "대기")
+    st.subheader("음성 상태")
+    st.markdown(
+        f"""
+        <div style="background:#f3f4f6;border-radius:12px;padding:12px;color:#111827;line-height:1.8;">
+          <div>상태: <strong>{label_map.get(status, '대기 중')}</strong></div>
+          <div>최근 인식: <strong>{transcript}</strong></div>
+          <div>호출어: <strong>{wake_word}</strong></div>
+          <div>최근 명령: <strong>{last_command}</strong></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def render_component() -> None:
     component_state = st.session_state.get(APP_STATE_KEY, {
         "status": "idle",
@@ -234,6 +265,7 @@ def render_component() -> None:
         "wakeWord": "미감지",
         "lastCommand": "대기",
         "event_id": "",
+        "conversation_started": st.session_state.get("conversation_started", False),
     })
     tts_text = st.session_state.get("last_tts_text", "")
 
@@ -243,10 +275,9 @@ def render_component() -> None:
             if isinstance(payload, dict):
                 st.session_state[APP_STATE_KEY] = payload
 
-    def on_tts_text_change() -> None:
-        return None
+    component_state["conversation_started"] = st.session_state.get("conversation_started", False)
 
-    result = st.components.v2.component(
+    component_factory = st.components.v2.component(
         "ai_speaker_component",
         html="<div id='root'></div>",
         js=r"""
@@ -294,34 +325,10 @@ def render_component() -> None:
             wakeWord: '미감지',
             lastCommand: '대기',
             event_id: '',
+            conversation_started: false,
           };
+          const conversationStarted = !!(data && data.conversation_started) || !!current.conversation_started;
           const ttsText = (data && data.tts_text) || '';
-
-          const render = () => {
-            const status = current.status || 'idle';
-            const transcript = current.transcript || '';
-            const wakeWord = current.wakeWord || '미감지';
-            const lastCommand = current.lastCommand || '대기';
-            const support = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
-            root.innerHTML = `
-              <div style="background:#f3f4f6;border-radius:18px;padding:18px;box-shadow:0 10px 20px rgba(0,0,0,0.05);">
-                <div style="font-weight:700;font-size:18px;margin-bottom:6px;">음성 제어</div>
-                <div style="margin-bottom:8px;">브라우저 음성 지원: <strong>${support ? '지원' : '미지원'}</strong></div>
-                <div style="margin-bottom:8px;">상태: <strong>${status}</strong></div>
-                <div style="margin-bottom:8px;">결과: <strong>${transcript || '없음'}</strong></div>
-                <div style="margin-bottom:8px;">호출어: <strong>${wakeWord}</strong></div>
-                <div style="margin-bottom:12px;">최근 명령: <strong>${lastCommand}</strong></div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  <button id="startBtn" style="padding:10px 14px;border-radius:10px;border:none;background:#7c3aed;color:white;cursor:pointer;">마이크 시작</button>
-                  <button id="stopBtn" style="padding:10px 14px;border-radius:10px;border:none;background:#374151;color:white;cursor:pointer;">종료</button>
-                </div>
-                <div style="margin-top:12px;display:flex;gap:8px;align-items:center;flex-wrap:wrap;">
-                  <input id="manualInput" placeholder="직접 입력" style="min-width:220px;padding:10px 12px;border-radius:10px;border:1px solid #d1d5db;" />
-                  <button id="sendText" style="padding:10px 14px;border-radius:10px;border:none;background:#10b981;color:white;cursor:pointer;">전송</button>
-                </div>
-              </div>
-            `;
-          };
 
           const updateState = (nextPayload) => {
             const merged = {
@@ -329,19 +336,46 @@ def render_component() -> None:
               ...nextPayload,
               event_id: nextPayload && nextPayload.event_id ? nextPayload.event_id : makeEventId(),
             };
+            current.status = merged.status;
+            current.transcript = merged.transcript ?? current.transcript;
+            current.wakeWord = merged.wakeWord ?? current.wakeWord;
+            current.lastCommand = merged.lastCommand ?? current.lastCommand;
             setStateValue('payload', merged);
           };
 
-          if (ttsText) {
-            speakText(ttsText);
-          }
+          const render = () => {
+            const status = current.status || 'idle';
+            const transcript = current.transcript || '';
+            const wakeWord = current.wakeWord || '미감지';
+            const lastCommand = current.lastCommand || '대기';
+            const support = !!(window.SpeechRecognition || window.webkitSpeechRecognition);
 
-          const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
-          const recognition = RecognitionCtor ? new RecognitionCtor() : null;
-          if (recognition) {
+            root.innerHTML = `
+              <div style="background:#f3f4f6;border-radius:16px;padding:14px;box-shadow:0 8px 18px rgba(0,0,0,0.04);color:#111827;">
+                <div style="font-size:13px;color:#4b5563;margin-bottom:6px;">음성 인식 상태</div>
+                <div style="font-size:12px;line-height:1.7;">
+                  <div>브라우저 지원: <strong>${support ? '지원' : '미지원'}</strong></div>
+                  <div>상태: <strong>${status}</strong></div>
+                  <div>결과: <strong>${transcript || '없음'}</strong></div>
+                  <div>호출어: <strong>${wakeWord}</strong></div>
+                  <div>최근 명령: <strong>${lastCommand}</strong></div>
+                </div>
+              </div>
+            `;
+          };
+
+          const startListening = () => {
+            const RecognitionCtor = window.SpeechRecognition || window.webkitSpeechRecognition;
+            if (!RecognitionCtor) {
+              updateState({ status: 'error', lastCommand: '브라우저 미지원' });
+              return null;
+            }
+
+            const recognition = new RecognitionCtor();
             recognition.lang = 'ko-KR';
             recognition.continuous = false;
             recognition.interimResults = false;
+
             recognition.onstart = () => updateState({ status: 'listening', lastCommand: '듣는 중' });
             recognition.onresult = (event) => {
               const lastResult = event.results[event.results.length - 1];
@@ -355,54 +389,51 @@ def render_component() -> None:
               });
             };
             recognition.onerror = () => updateState({ status: 'error', lastCommand: '음성 인식 오류' });
-            recognition.onend = () => updateState({ status: 'idle', lastCommand: '대기' });
+            recognition.onend = () => {
+              if (conversationStarted) {
+                try {
+                  recognition.start();
+                } catch (err) {
+                  updateState({ status: 'idle', lastCommand: '재시도' });
+                }
+              } else {
+                updateState({ status: 'idle', lastCommand: '대기' });
+              }
+            };
+
+            try {
+              recognition.start();
+            } catch (err) {
+              updateState({ status: 'idle', lastCommand: '재시도' });
+            }
+            return recognition;
+          };
+
+          if (ttsText) {
+            speakText(ttsText);
+          }
+
+          if (conversationStarted) {
+            startListening();
           }
 
           render();
-
-          const startBtn = root.querySelector('#startBtn');
-          if (startBtn) {
-            startBtn.addEventListener('click', () => {
-              if (!recognition) {
-                updateState({ status: 'unsupported', transcript: '', wakeWord: '미지원', lastCommand: '마이크 없음' });
-                return;
-              }
-              try {
-                recognition.start();
-              } catch (err) {
-                updateState({ status: 'error', lastCommand: '재시작 처리' });
-              }
-            });
-          }
-
-          const stopBtn = root.querySelector('#stopBtn');
-          if (stopBtn) {
-            stopBtn.addEventListener('click', () => {
-              if (recognition) { recognition.stop(); }
-              updateState({ status: 'idle', transcript: '', wakeWord: '미감지', lastCommand: '종료' });
-            });
-          }
-
-          const sendText = root.querySelector('#sendText');
-          const manualInput = root.querySelector('#manualInput');
-          if (sendText && manualInput) {
-            sendText.addEventListener('click', () => {
-              const text = (manualInput.value || '').trim();
-              if (!text) return;
-              const info = evaluateTranscript(text);
-              updateState({
-                status: 'manual_input',
-                transcript: text,
-                wakeWord: info.wakeDetected ? '감지' : '미감지',
-                lastCommand: info.stopDetected ? '종료' : '텍스트',
-              });
-              manualInput.value = '';
-            });
-          }
         }
         """,
         css="",
         isolate_styles=True,
+    )
+
+    result = component_factory(
+        key=WIDGET_KEY,
+        data={
+            "payload": component_state,
+            "conversation_started": st.session_state.get("conversation_started", False),
+        },
+        default={
+            "payload": component_state,
+        },
+        on_payload_change=on_payload_change,
     )
 
     if result is not None and isinstance(result, dict):
@@ -416,12 +447,12 @@ def render_component() -> None:
         "wakeWord": "미감지",
         "lastCommand": "대기",
         "event_id": "",
+        "conversation_started": st.session_state.get("conversation_started", False),
     })
     process_voice_event(component_state)
 
 
 ensure_state()
-render_component()
 
 st.title("🎧 헤이 친구 AI 스피커")
 st.caption("음성 인식 + 대화 + 검색 + 일정 알림을 한 번에")
@@ -434,12 +465,19 @@ with st.sidebar:
     ):
         if st.session_state.get("conversation_started", False):
             st.session_state["conversation_started"] = False
+            st.session_state["voice_active"] = False
             add_message("assistant", "대화가 종료되었습니다. 필요하면 다시 시작해 주세요.")
             st.session_state["last_tts_text"] = "대화가 종료되었습니다. 필요하면 다시 시작해 주세요."
         else:
             st.session_state["conversation_started"] = True
+            st.session_state["voice_active"] = True
+            st.session_state["last_seen_transcript"] = ""
             add_message("assistant", "대화가 시작되었습니다. 무엇을 도와드릴까요?")
             st.session_state["last_tts_text"] = "대화가 시작되었습니다. 무엇을 도와드릴까요?"
+
+    render_sidebar_voice_status()
+    render_component()
+    st.caption("음성 인식 상태는 여기에서 확인합니다.")
 
     st.subheader("설정")
     st.text_input("GROQ API Key", key="groq_api_key", type="password", help="브라우저 세션 메모리에만 저장됩니다. 서버 로그에는 남기지 않습니다.")
@@ -474,11 +512,6 @@ with main_col:
             st.write(item["text"])
             st.caption(item["time"])
 
-with side_col:
-    st.subheader("상태")
-    app_state = st.session_state.get(APP_STATE_KEY, {})
-    st.json(app_state)
-    st.caption("브라우저 음성 API는 환경과 브라우저 지원 여부에 따라 다를 수 있습니다.")
 
 if st.button("대화 기록 삭제"):
     st.session_state["messages"] = [
